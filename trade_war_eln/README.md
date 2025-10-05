@@ -25,50 +25,35 @@ trade_war_eln/
     └── summary.txt           # Key pricing numbers and component PVs
 ```
 
-## How to reproduce the numbers
+## Quick start – Dashboard only
 
-1. Activate a Python 3.10+ environment.
-2. From `trade_war_eln/`, run the lightweight script:
+1. **Install dependencies** (Python 3.10+, virtual environment recommended):
    ```bash
-   python3 src/eln_core.py
+   pip install -r requirements.txt
    ```
-   This prints pricing outputs and refreshes the CSV files and summary text in
-   `outputs/`.
-3. (Optional) Install `numpy pandas matplotlib python-pptx openpyxl yfinance`
-   and run `python3 src/eln_analysis.py` to build ready-to-plot charts, an Excel
-   workbook, and a 4-slide PPT deck automatically.
-4. To refresh the quantitative evidence behind the stock screen, run
-   `python3 src/data_snapshot.py` (requires `yfinance`). This regenerates
-   `outputs/market_metrics.csv` and `outputs/correlation_matrix.csv`.
-5. To reproduce the automated shortlist, run `python3 src/shortlist.py`. The
-   script filters candidate ETFs (ITA, SOXX, PAVE, IGM, IYW, XLI, VOX) to those
-   with positive 1Y returns and sub-30% realised volatility, harvests their top
-   holdings via yfinance, adds essential names, and scores each equity across
-   policy, China exposure (capped at 10%), liquidity, returns, and volatility.
-   Results are saved to `outputs/shortlist_results.csv` with source ETF tags and
-   an Excel rank formula.
+   (If you don’t have a requirements file, install `flask numpy pandas matplotlib python-pptx openpyxl yfinance`.)
 
-### Interactive dashboard
+2. **Launch the dashboard** from the project root:
+   ```bash
+   export FLASK_APP=trade_war_eln.dashboard.app
+   python3 -m flask run
+   ```
 
-Launch the Flask dashboard to tune parameters visually:
+3. **Open the browser** at `http://127.0.0.1:5000/`.
+   - The home page shows the latest shortlist and “interview talking points”.
+   - Adjust ETF sleeves, thresholds, or weights in the form and click *Run Shortlist*.
+   - The backend automatically regenerates payoff charts, pricing tables, and delta profiles (no manual script execution required).
 
-```bash
-export FLASK_APP=trade_war_eln.dashboard.app
-export FLASK_ENV=development  # optional auto-reload
-python3 -m flask run
-```
+4. **Download artefacts** directly from the `trade_war_eln/outputs/` folder: payoff and delta PNGs, Excel workbook, PPT template, and CSV exports are refreshed each time the dashboard recomputes.
 
-The dashboard lets you adjust thresholds/weights, choose ETF sleeves, and
-preview the resulting shortlist directly in your browser. Overrides entered in
-the form are applied in-memory (they do not overwrite
-`src/shortlist_config.json`).
+### Optional command-line utilities
 
-### Tuning inputs
+All underlying scripts remain available if you prefer the CLI:
 
-- Edit `src/shortlist_config.json` to change ETF sleeves, weights, and
-  thresholds (lookback, min return, max volatility, max China share). You can
-  point to an alternate config via `SHORTLIST_CONFIG=/path/to/config.json
-  python3 src/shortlist.py`.
+- `python3 src/shortlist.py` – regenerate the scored shortlist (reads `src/shortlist_config.json` or overrides via environment variable `SHORTLIST_CONFIG`).
+- `python3 src/eln_core.py` – dependency-light pricing breakdown.
+- `python3 src/eln_analysis.py` – full analytics pipeline (called automatically by the dashboard when charts are missing).
+- `python3 src/data_snapshot.py` – refresh market metrics and correlations from yfinance.
 
 ## Next steps for deliverables
 
