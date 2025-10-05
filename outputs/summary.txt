@@ -1,0 +1,10 @@
+Bullish ELN pricing summary
+Note PV: $11,663,721.45
+Basket spot: 252.00
+Basket volatility: 23.71%
+Basket dividend yield: 2.62%
+Component breakdown:
+  Long basket: $10,000,000.00
+  Long 20% ZCB: $1,911,994.96
+  Short call 80%: $-2,256,675.17
+  Long 2 calls 100%: $2,008,401.66
