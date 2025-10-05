@@ -5,59 +5,51 @@
 - **Election lens** – assume a U.S. administration prioritises strategic
   competition with China, sustaining tariffs and onshoring incentives.
 - **Filter pillars:**
-  1. *China dependency under control* – targeted companies must either derive
-     <30% of sales from China or be on a demonstrable path to reduce that
-     exposure while benefiting from U.S. substitution policy. We verified this
-     in 2023 Form 10-K filings (e.g., Lockheed Martin reports 26% international
-     sales with U.S. Government the dominant customer; Intel discloses China at
-     27% but highlights CHIPS Act–backed U.S./EU capacity ramp; Cisco’s APJC
-     share is 14%; Nucor ships predominantly to U.S. end markets).
-  2. *Direct beneficiary of onshoring or defence spending* – alignment with
-     hawkish policy levers such as defence appropriations, CHIPS Act subsidies,
-     or infrastructure reshoring.
-  3. *Balance sheet resilience & liquidity* – investment-grade credit, net cash
-     or modest leverage, and ample cash flow to manage volatility (screened via
-     yfinance fundamentals and rating agency reports).
-  4. *Option market depth* – tight bid/ask and weekly maturities, evidenced by
-     3-month average share volume (see quantitative table below) and open
-     interest on CBOE-listed options.
+  1. *China dependency under control* – candidates must keep China revenue
+     below the config threshold (10% by default). The helper script pulls the
+     value from `BASE_METADATA` populated with 10-K disclosures (e.g., CSX ~4%,
+     NSC 5%, PWR 8%, SRE 5%).
+  2. *Market momentum with risk discipline* – 1-year return must exceed
+     `min_one_year_return` (default 0%) while 90-day realised volatility stays
+     below 30%. These come straight from yfinance prices.
+  3. *Liquidity & scale* – 3M average volume and market cap are kept in the
+     output table; thinly traded names fail the filters upstream.
+  4. *Factor-based scoring* – surviving names are ranked using normalised
+     metrics: 1Y momentum, 63-day max drawdown, beta vs FXI (China proxy,
+     highest weight), revenue growth, and net margin. Factors are pulled from
+     yfinance price history and fundamentals (`Ticker.info`).
 
-- **Shortlist rationale (with quantitative evidence):**
-  - `LMT` – defence prime with U.S. Government purchasing ~74% of product sales
-    and only 26% international exposure (Lockheed Martin Form 10-K for
-    FY2023, p.10). Shares exhibit 26% 90-day realised vol and 1.6m shares of
-    average daily volume, supporting hedge liquidity.
-  - `INTC` – U.S. semiconductor champion; while China (incl. Hong Kong)
-    represented 27% of 2023 revenue, management is actively shifting advanced
-    node production to U.S./EU fabs backed by $8bn+ of CHIPS Act grants (Intel
-    Form 10-K FY2023, pp. 37 & 76). The stock has rallied 68% over the past
-    year with 117m shares of average volume, giving leveraged upside to
-    reshoring beneficiaries.
-  - `CSCO` – secure networking supplier with APJC revenue share of ~14% and
-    explicit U.S. federal security retrofits driving backlog (Cisco FY2023
-    Form 10-K, p.31). Lower 90-day vol (19%) complements higher beta names.
-  - `NUE` – U.S. steel leader; >80% of shipments stay domestic while tariff
-    protection and infrastructure demand support spreads (Nucor FY2023 Form
-    10-K, p.6). Supplies commodity upside with manageable vol (27%).
+- **Shortlist rationale (current base case):**
+  - `CSX` – Freight rail levered to domestic supply-chain investment; China
+    share ~4%, beta to FXI 0.14. Momentum modest (+8.7%) but low China beta and
+    resilient margins support a 0.29 composite.
+  - `NSC` – Rail logistics complement; 1Y return +25.8%, 18% vol, beta 0.19.
+    Provides stronger momentum with still muted China exposure (5%).
+  - `PWR` – Grid engineering leader benefiting from U.S. infrastructure spend;
+    highest momentum (+37%) with mid-20s vol. Commercial beta is higher (0.21)
+    but revenue growth offsets part of the penalty.
+  - `SRE` – Regulated U.S. utility; diversifies the basket with defensive
+    earnings. China share 5%, beta 0.20, net margin ~15%.
 
-**Quantitative snapshot (yfinance, as of 2025-10-03)**
+**Quantitative snapshot (yfinance, current run)**
 
-| Ticker | 1Y total return | 90d realised vol | 3M avg share volume | Notes |
-|---|---|---|---|---|
-| LMT | -15.3% | 26.3% | 1.64M | Defensive ballast; minimal China exposure |
-| INTC | +68.2% | 69.9% | 117.4M | Upside leverage to reshoring & AI capex |
-| CSCO | +33.6% | 18.9% | 19.2M | Lower-vol connectivity play benefiting from secure networking spend |
-| NUE | -6.6% | 27.2% | 1.64M | Cyclical lever on U.S. infrastructure & tariffs |
+| Ticker | 1Y return | 90d vol | 3M avg volume | Beta vs FXI | Notes |
+|---|---|---|---|---|---|
+| CSX | +8.7% | 25.1% | 20.2M | 0.14 | Freight rail with resilient domestic volumes |
+| NSC | +25.8% | 18.0% | 2.3M | 0.19 | Rail logistics; stronger momentum, still low China beta |
+| PWR | +37.1% | 24.5% | 1.0M | 0.21 | Grid engineering; high momentum, acceptable beta |
+| SRE | +15.8% | 20.2% | 3.9M | 0.20 | Regulated utility; defensive carry |
 
 Source: `outputs/market_metrics.csv` (derived via `yfinance`). Pairwise return
 correlations over the last 12 months are stored in
-`outputs/correlation_matrix.csv`; notably `corr(LMT, INTC) ≈ 0.08`, confirming
-the diversification benefit of mixing defence and semiconductors.
+`outputs/correlation_matrix.csv`; low correlation between rails and utility
+exposures adds basket diversification.
 
 The helper script `src/shortlist.py` formalises the same logic: it first
-filters defence/reshoring ETFs (ITA, SOXX, PAVE, IGM, IYW, XLI, VOX) to those
-with positive 1Y returns and sub-30% realised volatility, then pulls their top
-holdings via yfinance. After augmenting any essential names (CSCO, NUE, LMT),
+filters the ETF sleeves (ITA, SOXX, PAVE, IGM, IYW, XLI, VOX) for holdings, adds
+any manual/index lists from `shortlist_config.json`, enforces the hard filters
+on return/volatility/China share, and then scores the survivors with the
+factor-weighted composite described above.
 the equities are scored across policy alignment, China exposure, liquidity,
 returns, and volatility. A hard cap of 10% China revenue is applied. Running it
 regenerates `outputs/shortlist_results.csv` with a ranked table (including the

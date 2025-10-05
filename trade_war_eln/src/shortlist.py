@@ -1,12 +1,8 @@
 """Automated shortlisting of trade-war resilient U.S. equities.
 
-The script now sources its candidate universe from liquid U.S. sector ETFs that
-benefit from defence, reshoring, and secure infrastructure themes. ETFs are kept
-only if their own one-year performance is positive and their 90-day realised
-volatility is below 30%. Holdings from the qualifying ETFs are then scored using
-policy alignment, China exposure, liquidity, returns, and volatility filters.
-Outputs are written to ``outputs/shortlist_results.csv`` with an Excel-ready
-rank formula for transparency.
+This module aggregates ETF sleeves and optional index baskets, applies
+observable risk filters, and ranks candidates using data-driven factors sourced
+from yfinance (momentum, drawdown, China beta, revenue growth, net margin).
 """
 from __future__ import annotations
 
@@ -14,14 +10,14 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List
-
-import pandas as pd
-import yfinance as yf
 from functools import lru_cache
 from pathlib import Path
+from typing import Dict, Iterable, List, Set
 
-# ETF universe to examine. Each sleeve corresponds to a policy-aligned theme.
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("shortlist_config.json")
 
 DEFAULT_CONFIG = {
@@ -34,19 +30,21 @@ DEFAULT_CONFIG = {
         "XLI": "Industrial supply chain",
         "VOX": "Communications infrastructure",
     },
+    "index_lists": {},  # Optional manual index universes
     "thresholds": {
         "lookback_days": 365,
-        "vol_window": 63,
+        "vol_window": 90,
         "min_one_year_return": 0.0,
-        "max_realized_vol": 0.30,
+        "max_realized_vol": 30.0,
         "max_china_share": 0.10,
+        "long_lookback_days": 1825
     },
     "weights": {
-        "policy": 0.4,
-        "china": 0.25,
-        "returns": 0.15,
-        "liquidity": 0.1,
-        "volatility": 0.1,
+        "momentum_252": 0.30,
+        "max_drawdown_63": 0.10,
+        "beta_cn": 0.40,
+        "revenue_growth": 0.12,
+        "net_margin": 0.08,
     },
     "manual_inclusions": {
         "CSCO": "Secure networking (Cisco)",
@@ -55,14 +53,102 @@ DEFAULT_CONFIG = {
     },
 }
 
+BASE_METADATA: Dict[str, Dict[str, float | str]] = {
+    "LMT": {"description": "Defense prime (Lockheed Martin)", "china": 0.26},
+    "NOC": {"description": "Defense prime (Northrop Grumman)", "china": 0.25},
+    "GD": {"description": "Defense systems (General Dynamics)", "china": 0.24},
+    "RTX": {"description": "Defense/aerospace (RTX)", "china": 0.35},
+    "INTC": {"description": "US semiconductors (Intel)", "china": 0.27},
+    "AMD": {"description": "US semiconductors (AMD)", "china": 0.32},
+    "NVDA": {"description": "US semiconductors (Nvidia)", "china": 0.35},
+    "MU": {"description": "US memory (Micron)", "china": 0.30},
+    "CSCO": {"description": "Secure networking (Cisco)", "china": 0.14},
+    "JNPR": {"description": "Networking (Juniper)", "china": 0.20},
+    "HPE": {"description": "Edge compute (HPE)", "china": 0.28},
+    "NUE": {"description": "Domestic steel (Nucor)", "china": 0.18},
+    "X": {"description": "Domestic steel (US Steel)", "china": 0.22},
+    "CLF": {"description": "Steel/iron ore (Cleveland-Cliffs)", "china": 0.19},
+    "CAT": {"description": "Infrastructure capex (Caterpillar)", "china": 0.28},
+    "DE": {"description": "Industrial equipment (Deere)", "china": 0.24},
+    "GE": {"description": "Aero engines (GE Aerospace)", "china": 0.22},
+    "HWM": {"description": "Aerospace alloys (Howmet)", "china": 0.18},
+    "FAST": {"description": "Industrial fasteners (Fastenal)", "china": 0.19},
+    "URI": {"description": "US equipment rentals (United Rentals)", "china": 0.12},
+    "NSC": {"description": "Rail logistics (Norfolk Southern)", "china": 0.05},
+    "PWR": {"description": "Grid engineering (Quanta Services)", "china": 0.08},
+    "PH": {"description": "Motion control (Parker Hannifin)", "china": 0.24},
+    "SRE": {"description": "US utilities (Sempra)", "china": 0.05},
+    "CSX": {"description": "Rail logistics (CSX)", "china": 0.04},
+    "TT": {"description": "Climate control (Trane)", "china": 0.20},
+}
+
+NEGATIVE_FACTORS = {"max_drawdown_63", "beta_cn"}
+REFERENCE_RETURNS: Dict[str, pd.Series] = {}
+
+
+@lru_cache(maxsize=None)
+def _download_history(ticker: str, start_str: str, end_str: str) -> pd.DataFrame:
+    data = yf.download(ticker, start=start_str, end=end_str, auto_adjust=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.xs(ticker, axis=1, level=1)
+    return data
+
+
+@dataclass
+class StockMetrics:
+    ticker: str
+    description: str
+    sources: Set[str]
+    one_year_return: float
+    realized_vol: float
+    avg_volume: float
+    china_share: float
+    market_cap: float | None
+    factors: Dict[str, float]
+    sharpe_5y: float
+    max_drawdown_5y: float
+    composite: float = 0.0
+
+
+ETF_CANDIDATES: Dict[str, str] = {}
+INDEX_LISTS: Dict[str, object] = {}
+THRESHOLDS: Dict[str, float] = {}
+FACTOR_WEIGHTS: Dict[str, float] = {}
+MANUAL_INCLUSIONS: Dict[str, str] = {}
+LOOKBACK_DAYS = 365
+VOL_WINDOW = 90
+LONG_LOOKBACK_DAYS = 1825
+MIN_ONE_YEAR_RETURN = 0.0
+MAX_REALIZED_VOL = 30.0
+MAX_CHINA_SHARE = 0.10
+OUTPUT_DIR = "outputs"
+FACTOR_ORDER: List[str] = []
+
+
+def compute_long_horizon_metrics(ticker: str) -> Tuple[float, float]:
+    end = datetime.today()
+    start = end - timedelta(days=LONG_LOOKBACK_DAYS)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+    data = _download_history(ticker.upper(), start_str, end_str)
+    if data.empty or "Adj Close" not in data:
+        return 0.0, 0.0
+    price_series = data["Adj Close"].copy()
+    returns = price_series.pct_change().dropna()
+    sharpe = 0.0
+    if not returns.empty:
+        std = returns.std(ddof=0)
+        if std and not np.isnan(std) and std > 0:
+            sharpe = float((returns.mean() / std) * np.sqrt(252))
+    rolling_max = price_series.cummax()
+    drawdown = price_series / rolling_max - 1
+    max_drawdown = float(abs(drawdown.min()) * 100) if not drawdown.empty else 0.0
+    return sharpe, max_drawdown
+
 
 def deep_update(base: Dict, overrides: Dict) -> Dict:
     for key, value in overrides.items():
-        if (
-            isinstance(value, dict)
-            and key in base
-            and isinstance(base[key], dict)
-        ):
+        if isinstance(value, dict) and key in base and isinstance(base[key], dict):
             deep_update(base[key], value)
         else:
             base[key] = value
@@ -70,16 +156,14 @@ def deep_update(base: Dict, overrides: Dict) -> Dict:
 
 
 def load_config(path: str | None = None) -> Dict:
-    """Return configuration dict by merging defaults with file overrides."""
-
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     cfg_path = Path(path) if path else DEFAULT_CONFIG_PATH
     if cfg_path.exists():
         try:
-            with cfg_path.open('r', encoding='utf-8') as handle:
+            with cfg_path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             deep_update(config, data)
-        except Exception as exc:  # pragma: no cover - defensive logging
+        except Exception as exc:  # pragma: no cover
             print(f"Warning: failed to load config {cfg_path}: {exc}. Using defaults.")
     else:
         if path:
@@ -88,81 +172,31 @@ def load_config(path: str | None = None) -> Dict:
 
 
 def apply_config(config: Dict) -> None:
-    global ETF_CANDIDATES, THRESHOLDS, WEIGHTS, MANUAL_INCLUSIONS
-    global LOOKBACK_DAYS, VOL_WINDOW, MIN_ONE_YEAR_RETURN, MAX_REALIZED_VOL, MAX_CHINA_SHARE
+    global ETF_CANDIDATES, INDEX_LISTS, THRESHOLDS, FACTOR_WEIGHTS, MANUAL_INCLUSIONS
+    global LOOKBACK_DAYS, VOL_WINDOW, LONG_LOOKBACK_DAYS, MIN_ONE_YEAR_RETURN, MAX_REALIZED_VOL, MAX_CHINA_SHARE, FACTOR_ORDER
 
-    ETF_CANDIDATES = config["etf_candidates"]
-    THRESHOLDS = config["thresholds"]
-    WEIGHTS = config["weights"]
-    MANUAL_INCLUSIONS = config["manual_inclusions"]
+    ETF_CANDIDATES = config.get("etf_candidates", {})
+    INDEX_LISTS = config.get("index_lists", {})
+    THRESHOLDS = config.get("thresholds", {})
+    FACTOR_WEIGHTS = config.get("weights", {})
+    MANUAL_INCLUSIONS = config.get("manual_inclusions", {})
 
     LOOKBACK_DAYS = int(THRESHOLDS.get("lookback_days", 365))
-    VOL_WINDOW = int(THRESHOLDS.get("vol_window", 63))
+    VOL_WINDOW = int(THRESHOLDS.get("vol_window", 90))
     MIN_ONE_YEAR_RETURN = float(THRESHOLDS.get("min_one_year_return", 0.0))
     MAX_REALIZED_VOL = float(THRESHOLDS.get("max_realized_vol", 30.0))
     if MAX_REALIZED_VOL <= 1:
         MAX_REALIZED_VOL *= 100
     MAX_CHINA_SHARE = float(THRESHOLDS.get("max_china_share", 0.10))
-
-
-CONFIG = load_config(os.environ.get("SHORTLIST_CONFIG"))
-apply_config(CONFIG)
-OUTPUT_DIR = "outputs"
-
-
-# Base metadata with qualitative China exposure estimates (share of revenue) and
-# policy-alignment scores. Values are sourced from FY2023 10-Ks, investor
-# presentations, and sector research used in the structuring memo.
-BASE_METADATA: Dict[str, Dict[str, float | str]] = {
-    "LMT": {"description": "Defense prime (Lockheed Martin)", "china": 0.26, "policy": 1.0},
-    "NOC": {"description": "Defense prime (Northrop Grumman)", "china": 0.25, "policy": 0.75},
-    "GD": {"description": "Defense systems (General Dynamics)", "china": 0.24, "policy": 0.7},
-    "RTX": {"description": "Defense/aerospace (RTX)", "china": 0.35, "policy": 0.75},
-    "INTC": {"description": "US semiconductors (Intel)", "china": 0.27, "policy": 0.95},
-    "AMD": {"description": "US semiconductors (AMD)", "china": 0.32, "policy": 0.7},
-    "NVDA": {"description": "US semiconductors (Nvidia)", "china": 0.35, "policy": 0.65},
-    "MU": {"description": "US memory (Micron)", "china": 0.30, "policy": 0.7},
-    "CSCO": {"description": "Secure networking (Cisco)", "china": 0.14, "policy": 0.85},
-    "JNPR": {"description": "Networking (Juniper)", "china": 0.20, "policy": 0.6},
-    "HPE": {"description": "Edge compute (HPE)", "china": 0.28, "policy": 0.55},
-    "NUE": {"description": "Domestic steel (Nucor)", "china": 0.18, "policy": 0.95},
-    "X": {"description": "Domestic steel (US Steel)", "china": 0.22, "policy": 0.7},
-    "CLF": {"description": "Steel/iron ore (Cleveland-Cliffs)", "china": 0.19, "policy": 0.7},
-    "CAT": {"description": "Infrastructure capex (Caterpillar)", "china": 0.28, "policy": 0.6},
-    "DE": {"description": "Industrial equipment (Deere)", "china": 0.24, "policy": 0.55},
-    "GE": {"description": "Aero engines (GE Aerospace)", "china": 0.22, "policy": 0.7},
-    "HWM": {"description": "Aerospace alloys (Howmet)", "china": 0.18, "policy": 0.65},
-    "FAST": {"description": "Industrial fasteners (Fastenal)", "china": 0.19, "policy": 0.6},
-    "URI": {"description": "US equipment rentals (United Rentals)", "china": 0.12, "policy": 0.7},
-    "NSC": {"description": "Rail logistics (Norfolk Southern)", "china": 0.05, "policy": 0.5},
-    "PWR": {"description": "Grid engineering (Quanta Services)", "china": 0.08, "policy": 0.75},
-    "PH": {"description": "Motion control (Parker Hannifin)", "china": 0.24, "policy": 0.65},
-    "SRE": {"description": "US utilities (Sempra)", "china": 0.05, "policy": 0.5},
-    "CSX": {"description": "Rail logistics (CSX)", "china": 0.04, "policy": 0.45},
-    "TT": {"description": "Climate control (Trane)", "china": 0.20, "policy": 0.55},
-}
-
-@dataclass
-class StockMetrics:
-    ticker: str
-    one_year_return: float
-    realized_vol: float
-    avg_volume: float
-    policy_score: float
-    china_share: float
-    liquidity_score: float
-    return_score: float
-    volatility_score: float
-    china_score: float
-    composite: float
-    market_cap: float | None
+    LONG_LOOKBACK_DAYS = int(THRESHOLDS.get("long_lookback_days", 1825))
+    FACTOR_ORDER = list(FACTOR_WEIGHTS.keys())
 
 
 def fetch_price_history(ticker: str, start: datetime, end: datetime) -> pd.DataFrame:
-    data = yf.download(ticker, start=start, end=end, auto_adjust=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        data = data.xs(ticker, axis=1, level=1)
-    return data
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+    data = _download_history(ticker.upper(), start_str, end_str)
+    return data.copy()
 
 
 @lru_cache(maxsize=None)
@@ -170,11 +204,61 @@ def fetch_market_cap(ticker: str) -> float | None:
     try:
         info = yf.Ticker(ticker).fast_info
         market_cap = getattr(info, "market_cap", None)
-        if market_cap is None:
-            market_cap = info.get("market_cap") if isinstance(info, dict) else None
+        if market_cap is None and isinstance(info, dict):
+            market_cap = info.get("market_cap")
         return market_cap
     except Exception:
         return None
+
+
+@lru_cache(maxsize=None)
+def fetch_info(ticker: str) -> dict:
+    try:
+        return yf.Ticker(ticker).info
+    except Exception:
+        return {}
+
+
+def get_reference_returns(symbol: str) -> pd.Series:
+    symbol = symbol.upper()
+    cached = REFERENCE_RETURNS.get(symbol)
+    if cached is not None:
+        return cached
+    data = yf.download(symbol, period="1y", interval="1d", auto_adjust=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.xs(symbol, axis=1, level=1)
+    series = data["Adj Close"].pct_change().dropna()
+    REFERENCE_RETURNS[symbol] = series
+    return series
+
+
+def compute_factor_values(ticker: str, prices: pd.DataFrame, returns: pd.Series) -> Dict[str, float]:
+    price_series = prices["Adj Close"]
+    momentum = (price_series.iloc[-1] / price_series.iloc[0] - 1) * 100
+
+    rolling_max = price_series.rolling(63).max()
+    drawdown_series = price_series / rolling_max - 1
+    max_drawdown = abs(drawdown_series.min() * 100) if not drawdown_series.empty else 0.0
+
+    fx_returns = get_reference_returns("FXI")
+    aligned_fx = fx_returns.reindex(returns.index).dropna()
+    aligned_returns = returns.reindex(aligned_fx.index).dropna()
+    if len(aligned_returns) >= 2 and aligned_fx.var(ddof=0) > 0:
+        beta_cn = float(np.cov(aligned_returns, aligned_fx)[0, 1] / aligned_fx.var(ddof=0))
+    else:
+        beta_cn = 0.0
+
+    info = fetch_info(ticker)
+    revenue_growth = float((info.get("revenueGrowth") or 0.0) * 100)
+    net_margin = float((info.get("profitMargins") or 0.0) * 100)
+
+    return {
+        "momentum_252": float(momentum),
+        "max_drawdown_63": float(max_drawdown),
+        "beta_cn": beta_cn,
+        "revenue_growth": revenue_growth,
+        "net_margin": net_margin,
+    }
 
 
 def fetch_holdings(etf: str) -> List[str]:
@@ -202,75 +286,10 @@ def fetch_holdings(etf: str) -> List[str]:
     return symbols
 
 
-def score_liquidity(avg_volume: float) -> float:
-    return min(avg_volume / 2_000_000, 1.0)
-
-
-def score_returns(one_year_return: float, benchmark: float) -> float:
-    excess = one_year_return - benchmark
-    baseline = 0.2
-    if excess <= -30:
-        return baseline
-    if excess >= 25:
-        return 1.0
-    scale = (excess + 30) / 55
-    return baseline + (1 - baseline) * max(0.0, min(1.0, scale))
-
-
-def score_volatility(realized_vol: float) -> float:
-    if realized_vol >= 80:
-        return 0.0
-    if realized_vol <= 15:
-        return 1.0
-    return max(0.0, 1 - (realized_vol - 15) / 65)
-
-
-def score_china(china_share: float) -> float:
-    if china_share >= 0.5:
-        return 0.0
-    if china_share <= 0.1:
-        return 1.0
-    return max(0.0, 1 - (china_share - 0.1) / 0.4)
-
-
-def filter_etfs() -> Dict[str, str]:
-    qualifying: Dict[str, str] = {}
-    end = datetime.today()
-    start = end - timedelta(days=LOOKBACK_DAYS)
-    for etf, description in ETF_CANDIDATES.items():
-        hist = fetch_price_history(etf, start, end)
-        if hist.empty or 'Adj Close' not in hist:
-            print(f"Skipping ETF {etf}: insufficient history")
-            continue
-        hist['Return'] = hist['Adj Close'].pct_change()
-        if hist['Return'].dropna().empty:
-            print(f"Skipping ETF {etf}: invalid data")
-            continue
-        one_year_return = (hist['Adj Close'].iloc[-1] / hist['Adj Close'].iloc[0] - 1) * 100
-        realized_vol = hist['Return'].tail(VOL_WINDOW).std() * (252 ** 0.5) * 100
-        if one_year_return <= MIN_ONE_YEAR_RETURN:
-            print(
-                f"Skipping ETF {etf}: 1Y return {one_year_return:.2f}% "
-                f"<= threshold {MIN_ONE_YEAR_RETURN:.2f}%"
-            )
-            continue
-        if realized_vol >= MAX_REALIZED_VOL:
-            print(
-                f"Skipping ETF {etf}: realized vol {realized_vol:.2f}% "
-                f">= threshold {MAX_REALIZED_VOL:.2f}%"
-            )
-            continue
-        qualifying[etf] = description
-    return qualifying
-
-
 def load_candidates() -> Dict[str, Dict[str, object]]:
-    selected_etfs = filter_etfs()
-    if not selected_etfs:
-        print("Warning: no ETFs met filters; reverting to full candidate list")
-        selected_etfs = ETF_CANDIDATES
-
+    selected_etfs = ETF_CANDIDATES
     tickers: Dict[str, Dict[str, object]] = {}
+
     for etf, sleeve in selected_etfs.items():
         symbols = fetch_holdings(etf)
         if not symbols:
@@ -282,11 +301,34 @@ def load_candidates() -> Dict[str, Dict[str, object]]:
                 entry = tickers.setdefault(
                     symbol,
                     {
-                        "description": meta['description'],
+                        "description": meta.get("description", symbol),
                         "sources": set(),
                     },
                 )
                 entry["sources"].add(f"{sleeve} ({etf})")
+
+    for index_name, sources in INDEX_LISTS.items():
+        symbols: List[str] = []
+        if isinstance(sources, list):
+            symbols = [str(t).upper() for t in sources]
+        elif isinstance(sources, str):
+            path = Path(sources)
+            if path.exists():
+                symbols = [line.strip().upper() for line in path.read_text().splitlines() if line.strip()]
+            else:
+                symbols = [token.strip().upper() for token in sources.split(',') if token.strip()]
+        for symbol in symbols:
+            if symbol not in BASE_METADATA:
+                continue
+            meta = BASE_METADATA[symbol]
+            entry = tickers.setdefault(
+                symbol,
+                {
+                    "description": meta.get("description", symbol),
+                    "sources": set(),
+                },
+            )
+            entry["sources"].add(f"{index_name} (index)")
 
     for symbol, desc in MANUAL_INCLUSIONS.items():
         if symbol in BASE_METADATA:
@@ -305,114 +347,97 @@ def build_metrics(candidates: Dict[str, Dict[str, object]]) -> List[StockMetrics
     end = datetime.today()
     start = end - timedelta(days=LOOKBACK_DAYS)
 
-    spy_hist = fetch_price_history("SPY", start, end)
-    spy_return = (spy_hist['Adj Close'].iloc[-1] / spy_hist['Adj Close'].iloc[0] - 1) * 100
-
-    results: List[StockMetrics] = []
-    for ticker in candidates:
-        hist = fetch_price_history(ticker, start, end)
-        if hist.empty or 'Adj Close' not in hist or 'Volume' not in hist:
-            print(f"Skipping {ticker}: insufficient price history")
+    metrics: List[StockMetrics] = []
+    for ticker, meta in candidates.items():
+        base_meta = BASE_METADATA.get(ticker)
+        if base_meta is None:
             continue
-        hist['Return'] = hist['Adj Close'].pct_change()
-        if hist['Adj Close'].isna().all() or hist['Return'].dropna().empty:
-            print(f"Skipping {ticker}: invalid data points")
-            continue
-        one_year_return = (hist['Adj Close'].iloc[-1] / hist['Adj Close'].iloc[0] - 1) * 100
-        if one_year_return <= MIN_ONE_YEAR_RETURN:
-            print(
-                f"Skipping {ticker}: 1Y return {one_year_return:.2f}% "
-                f"<= threshold {MIN_ONE_YEAR_RETURN:.2f}%"
-            )
-            continue
-        realized_vol = hist['Return'].tail(VOL_WINDOW).std() * (252 ** 0.5) * 100
-        if realized_vol >= MAX_REALIZED_VOL:
-            print(
-                f"Skipping {ticker}: realized vol {realized_vol:.2f}% "
-                f">= threshold {MAX_REALIZED_VOL:.2f}%"
-            )
-            continue
-        avg_volume = hist['Volume'].tail(VOL_WINDOW).mean()
-
-        meta = BASE_METADATA.get(ticker)
-        if meta is None:
-            continue
-
-        china_share = float(meta['china'])
+        china_share = float(base_meta.get("china", 0.5))
         if china_share >= MAX_CHINA_SHARE:
-            print(f"Skipping {ticker}: China share {china_share:.2%} exceeds {MAX_CHINA_SHARE:.0%} cap")
             continue
 
-        liquidity = score_liquidity(avg_volume)
-        ret_score = score_returns(one_year_return, spy_return)
-        vol_score = score_volatility(realized_vol)
-        china_score = score_china(china_share)
-        policy = float(meta['policy'])
+        hist = fetch_price_history(ticker, start, end)
+        if hist.empty or "Adj Close" not in hist or "Volume" not in hist:
+            continue
+        returns = hist["Adj Close"].pct_change().dropna()
+        if returns.empty:
+            continue
 
-        composite = (
-            WEIGHTS['policy'] * policy
-            + WEIGHTS['china'] * china_score
-            + WEIGHTS['returns'] * ret_score
-            + WEIGHTS['liquidity'] * liquidity
-            + WEIGHTS['volatility'] * vol_score
-        )
+        one_year_return = (hist["Adj Close"].iloc[-1] / hist["Adj Close"].iloc[0] - 1) * 100
+        if one_year_return <= MIN_ONE_YEAR_RETURN:
+            continue
 
-        results.append(
+        realized_vol = returns.tail(VOL_WINDOW).std() * np.sqrt(252) * 100
+        if realized_vol >= MAX_REALIZED_VOL:
+            continue
+
+        avg_volume = hist["Volume"].tail(VOL_WINDOW).mean()
+
+        factors = compute_factor_values(ticker, hist, returns)
+        market_cap = fetch_market_cap(ticker)
+        sharpe_5y, max_drawdown_5y = compute_long_horizon_metrics(ticker)
+
+        metrics.append(
             StockMetrics(
                 ticker=ticker,
-                one_year_return=one_year_return,
-                realized_vol=realized_vol,
-                avg_volume=avg_volume,
-                policy_score=policy,
+                description=meta.get("description", ticker),
+                sources=set(meta.get("sources", set())),
+                one_year_return=float(one_year_return),
+                realized_vol=float(realized_vol),
+                avg_volume=float(avg_volume or 0.0),
                 china_share=china_share,
-                liquidity_score=liquidity,
-                return_score=ret_score,
-                volatility_score=vol_score,
-                china_score=china_score,
-                composite=composite,
-                market_cap=fetch_market_cap(ticker),
+                market_cap=market_cap,
+                factors=factors,
+                sharpe_5y=sharpe_5y,
+                max_drawdown_5y=max_drawdown_5y,
             )
         )
-    return results
+
+    if not metrics:
+        return []
+
+    factor_df = pd.DataFrame([m.factors for m in metrics], index=[m.ticker for m in metrics])
+    factor_df = factor_df.reindex(columns=FACTOR_ORDER, fill_value=np.nan).fillna(0.0)
+
+    normalized = factor_df.copy()
+    for col in factor_df.columns:
+        series = factor_df[col]
+        std = series.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            normalized[col] = 0.0
+        else:
+            normalized[col] = (series - series.mean()) / std
+
+    for m in metrics:
+        score = 0.0
+        for factor, weight in FACTOR_WEIGHTS.items():
+            val = normalized.at[m.ticker, factor]
+            if factor in NEGATIVE_FACTORS:
+                val *= -1
+            score += val * weight
+        m.composite = float(score)
+
+    return metrics
 
 
-def _excel_column_label(index: int) -> str:
-    label = ""
-    while index >= 0:
-        index, remainder = divmod(index, 26)
-        label = chr(ord('A') + remainder) + label
-        index -= 1
-    return label
-
-
-def _format_market_cap(value: float | None) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"{value:.1f}"
-
-
-def metrics_to_frame(metrics: Iterable[StockMetrics], candidates: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+def metrics_to_frame(metrics: Iterable[StockMetrics]) -> pd.DataFrame:
     rows = []
     for m in metrics:
-        info = candidates[m.ticker]
-        sources = ", ".join(sorted(info.get("sources", [])))
-        market_cap = m.market_cap
-        market_cap_bn = market_cap / 1e9 if market_cap else None
         rows.append(
             {
                 "Ticker": m.ticker,
-                "Description": info["description"],
-                "Source ETFs": sources,
+                "Description": m.description,
+                "Source Tags": "; ".join(sorted(m.sources)) if m.sources else "N/A",
                 "1Y Return %": m.one_year_return,
                 "90D Realized Vol %": m.realized_vol,
                 "Avg Volume (3M)": m.avg_volume,
-                "Policy Score": m.policy_score,
-                "China Share": m.china_share,
-                "Market Cap ($bn)": market_cap_bn,
-                "Return Score": m.return_score,
-                "Liquidity Score": m.liquidity_score,
-                "Volatility Score": m.volatility_score,
-                "China Score": m.china_score,
+                "China Share %": m.china_share * 100,
+                "Market Cap ($bn)": (m.market_cap / 1e9) if m.market_cap else None,
+                "Momentum 1Y %": m.factors["momentum_252"],
+                "Max Drawdown 63d %": m.factors["max_drawdown_63"],
+                "Beta vs FXI": m.factors["beta_cn"],
+                "Revenue Growth %": m.factors["revenue_growth"],
+                "Net Margin %": m.factors["net_margin"],
                 "Composite Score": m.composite,
             }
         )
@@ -420,43 +445,22 @@ def metrics_to_frame(metrics: Iterable[StockMetrics], candidates: Dict[str, Dict
     df.sort_values(by="Composite Score", ascending=False, inplace=True)
     df.reset_index(drop=True, inplace=True)
     df.insert(0, "Rank", df.index + 1)
-
-    comp_col_index = df.columns.get_loc("Composite Score")
-    comp_col_letter = _excel_column_label(comp_col_index)
-    total_rows = len(df) + 1  # header occupies row 1 in Excel
-    formulas = []
-    for idx in range(len(df)):
-        row = idx + 2
-        formulas.append(
-            f"=RANK(${comp_col_letter}${row},${comp_col_letter}$2:${comp_col_letter}${total_rows},0)"
-        )
-    df["Rank_Formula"] = formulas
     return df
 
 
 def display_table(table: pd.DataFrame, limit: int = 10) -> None:
-    display_cols = [
+    columns = [
         "Rank",
         "Ticker",
         "Description",
-        "Source ETFs",
         "Composite Score",
-        "Policy Score",
-        "China Share",
-        "Market Cap ($bn)",
+        "Beta vs FXI",
+        "China Share %",
         "1Y Return %",
         "90D Realized Vol %",
     ]
-    formatters = {
-        "Composite Score": "{:.2f}".format,
-        "Policy Score": "{:.2f}".format,
-        "China Share": "{:.2%}".format,
-        "Market Cap ($bn)": _format_market_cap,
-        "1Y Return %": "{:.2f}".format,
-        "90D Realized Vol %": "{:.2f}".format,
-    }
-    print("Top trade-war beneficiaries (filtered & scored):")
-    print(table[display_cols].head(limit).to_string(index=False, formatters=formatters))
+    available = [c for c in columns if c in table.columns]
+    print(table[available].head(limit).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
 
 
 def generate_shortlist(
@@ -466,7 +470,7 @@ def generate_shortlist(
     write_output: bool = False,
     output_path: str | None = None,
 ) -> tuple[pd.DataFrame, Dict]:
-    """Generate shortlist DataFrame using optional config overrides."""
+    """Generate the shortlist DataFrame and effective config."""
 
     config = load_config(config_path)
     if config_overrides:
@@ -475,13 +479,13 @@ def generate_shortlist(
 
     candidates = load_candidates()
     if not candidates:
-        raise RuntimeError("Candidate universe is empty after ETF aggregation.")
+        raise RuntimeError("Candidate universe is empty after aggregation.")
 
     metrics = build_metrics(candidates)
     if not metrics:
         raise RuntimeError("No equities met the screening thresholds.")
 
-    table = metrics_to_frame(metrics, candidates)
+    table = metrics_to_frame(metrics)
 
     destination: Path | None = None
     if write_output:
