@@ -31,7 +31,7 @@ Run the app with fully interactive Plotly charts (no static images).
 
 1) Install dependencies (Python 3.10+):
 ```bash
-pip install dash plotly pandas numpy yfinance
+pip install -r requirements.txt
 ```
 
 2) Launch from the repo root (auto‑opens your browser):
@@ -43,7 +43,7 @@ Optional environment overrides:
 DASH_HOST=0.0.0.0 DASH_PORT=8050 python run_dash.py
 ```
 
-Alternatively:
+Alternatively (without the helper script):
 ```bash
 python -m trade_war_eln.dashboard.dash_app
 ```
